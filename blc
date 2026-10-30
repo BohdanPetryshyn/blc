@@ -1,0 +1,480 @@
+#!/usr/bin/python3 -I
+"""blc: block websites on a schedule on macOS.
+
+`blc` (run as you) edits ~/.config/blc/config.json and appends to ~/.config/blc/log.
+`blc daemon` (run as root by launchd) re-reads that config every couple of seconds and
+keeps one file per blocked domain in /etc/resolver. Each file sends DNS lookups for the
+domain and all its subdomains to a tiny responder inside the daemon that answers
+"no such domain", so blocked sites fail at once in Safari and other apps using system DNS.
+"""
+
+import argparse
+import json
+import os
+import re
+import select
+import socket
+import stat
+import struct
+import subprocess
+import sys
+import time
+
+CONFIG_PATH = os.path.expanduser("~/.config/blc/config.json")
+LOG_PATH = os.path.expanduser("~/.config/blc/log")
+RESOLVER_DIR = "/etc/resolver"
+RESPONDER_ADDR = ("127.0.0.1", 54)
+MARKER = "# managed by blc"
+MIN_COMMENT = 50
+MAX_PAUSE = 2 * 60 * 60
+POLL_SECONDS = 2
+MAX_CONFIG_BYTES = 1 << 20
+ALL_DAY = (0, 24 * 60)
+
+DOMAIN_RE = re.compile(
+    r"(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z][a-z0-9-]{0,61}[a-z0-9]"
+)
+
+
+class UserError(ValueError):
+    """Bad input or state; printed as a one-line error."""
+
+
+# --- parsing ---------------------------------------------------------------
+
+
+def normalize_domain(text):
+    """'*.YouTube.com.' -> 'youtube.com'. A domain always covers its subdomains."""
+    domain = text.strip().lower().rstrip(".")
+    if domain.startswith("*."):
+        domain = domain[2:]
+    if not DOMAIN_RE.fullmatch(domain):
+        raise UserError(f"not a domain: {text!r} (expected something like youtube.com)")
+    return domain
+
+
+def parse_clock(text):
+    """'HH:MM' in 24h time -> minutes since midnight. '24:00' is allowed as an end."""
+    match = re.fullmatch(r"(\d{1,2}):(\d{2})", text.strip())
+    if match:
+        hours, minutes = int(match.group(1)), int(match.group(2))
+        if minutes < 60 and (hours < 24 or (hours == 24 and minutes == 0)):
+            return hours * 60 + minutes
+    raise UserError(f"bad time {text!r}, expected HH:MM like 07:30 or 19:00")
+
+
+def format_clock(minutes):
+    return f"{minutes // 60:02d}:{minutes % 60:02d}"
+
+
+def parse_duration(text):
+    """'30min', '30m', '30', '1h', '1h30m' -> seconds."""
+    match = re.fullmatch(r"(?:(\d+)h)?(?:(\d+)(?:m|min|mins)?)?", text.strip().lower())
+    seconds = 0
+    if match and text.strip():
+        seconds = int(match.group(1) or 0) * 3600 + int(match.group(2) or 0) * 60
+    if seconds <= 0:
+        raise UserError(f"bad duration {text!r}, expected something like 30min, 1h or 1h30m")
+    if seconds > MAX_PAUSE:
+        raise UserError(f"a pause can be at most {MAX_PAUSE // 3600}h")
+    return seconds
+
+
+def require_comment(words):
+    comment = " ".join(" ".join(words).split())
+    if len(comment) < MIN_COMMENT:
+        raise UserError(
+            f"say why in a comment of at least {MIN_COMMENT} characters (got {len(comment)})"
+        )
+    return comment
+
+
+def describe(start, end):
+    if (start, end) == ALL_DAY:
+        return "all day"
+    return f"{format_clock(start)}-{format_clock(end)}"
+
+
+def clock(timestamp):
+    return time.strftime("%H:%M", time.localtime(timestamp))
+
+
+# --- schedule --------------------------------------------------------------
+
+
+def in_window(start, end, minute):
+    """Is minute-of-day in [start, end)? A window with start >= end wraps past midnight."""
+    if start < end:
+        return start <= minute < end
+    return minute >= start or minute < end
+
+
+def valid_rules(config):
+    """(domain, start, end) for each rule that parses; anything malformed is skipped."""
+    rules = []
+    for rule in config["rules"]:
+        try:
+            rules.append(
+                (normalize_domain(rule["domain"]), parse_clock(rule["start"]), parse_clock(rule["end"]))
+            )
+        except (KeyError, TypeError, ValueError, AttributeError):
+            continue
+    return rules
+
+
+def active_pauses(config, now):
+    """{domain: until} for pauses that haven't expired."""
+    pauses = {}
+    for pause in config["pauses"]:
+        try:
+            until = float(pause["until"])
+            if until > now:
+                pauses[normalize_domain(pause["domain"])] = until
+        except (KeyError, TypeError, ValueError, AttributeError):
+            continue
+    return pauses
+
+
+def blocked_now(config, now=None):
+    """Domains that should be blocked at unix time `now`."""
+    now = time.time() if now is None else now
+    local = time.localtime(now)
+    minute = local.tm_hour * 60 + local.tm_min
+    paused = active_pauses(config, now)
+    return {
+        domain
+        for domain, start, end in valid_rules(config)
+        if domain not in paused and in_window(start, end, minute)
+    }
+
+
+# --- config and log --------------------------------------------------------
+
+
+def read_config(path):
+    """Read a config without trusting it: the daemon runs as root, the file is the user's."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return {"rules": [], "pauses": []}
+    with os.fdopen(fd, "rb") as f:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise ValueError("not a regular file")
+        data = json.loads(f.read(MAX_CONFIG_BYTES))
+    if not isinstance(data, dict):
+        raise ValueError("expected a JSON object")
+    rules, pauses = data.get("rules"), data.get("pauses")
+    return {
+        "rules": rules if isinstance(rules, list) else [],
+        "pauses": pauses if isinstance(pauses, list) else [],
+    }
+
+
+def load_config():
+    try:
+        return read_config(CONFIG_PATH)
+    except (ValueError, OSError) as e:
+        raise UserError(f"can't read {CONFIG_PATH}: {e}")
+
+
+def save_config(config):
+    now = time.time()
+    config["pauses"] = [p for p in config["pauses"] if p.get("until", 0) > now]
+    os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
+    tmp = CONFIG_PATH + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(config, f, indent=2)
+        f.write("\n")
+    os.replace(tmp, CONFIG_PATH)
+
+
+def log_event(action, domain, detail="", comment=""):
+    os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
+    fields = [time.strftime("%Y-%m-%d %H:%M"), action, domain, detail, comment]
+    with open(LOG_PATH, "a") as f:
+        f.write("\t".join(fields).rstrip("\t") + "\n")
+
+
+# --- DNS -------------------------------------------------------------------
+
+
+def build_query(name, qid=0x1234):
+    """A minimal DNS query for the A record of `name`."""
+    labels = b"".join(bytes([len(part)]) + part.encode() for part in name.split("."))
+    return struct.pack(">HHHHHH", qid, 0x0100, 1, 0, 0, 0) + labels + b"\x00" + struct.pack(">HH", 1, 1)
+
+
+def nxdomain_reply(query):
+    """The NXDOMAIN answer to a DNS query, or None if the packet isn't a plain query."""
+    if len(query) < 12:
+        return None
+    qid, flags, qdcount = struct.unpack(">HHH", query[:6])
+    if flags & 0x8000 or qdcount != 1:
+        return None
+    end = 12
+    while end < len(query) and query[end]:
+        if query[end] & 0xC0:
+            return None
+        end += query[end] + 1
+    end += 5  # root label, QTYPE, QCLASS
+    if end > len(query):
+        return None
+    # QR=1, keep opcode and RD, RA=1, RCODE=3 (NXDOMAIN)
+    reply_flags = 0x8000 | (flags & 0x7900) | 0x0080 | 3
+    return struct.pack(">HHHHHH", qid, reply_flags, 1, 0, 0, 0) + query[12:end]
+
+
+def daemon_running(timeout=0.5):
+    """Ask the daemon's responder a question; it only answers if it's up."""
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        sock.settimeout(timeout)
+        try:
+            sock.sendto(build_query("blc.invalid"), RESPONDER_ADDR)
+            reply = sock.recv(512)
+        except OSError:
+            return False
+    return len(reply) >= 4 and struct.unpack(">H", reply[2:4])[0] & 0xF == 3
+
+
+def managed_domains(resolver_dir):
+    """Domains that have a blc-managed file in resolver_dir."""
+    try:
+        names = os.listdir(resolver_dir)
+    except FileNotFoundError:
+        return set()
+    domains = set()
+    for name in names:
+        try:
+            with open(os.path.join(resolver_dir, name)) as f:
+                if f.readline().rstrip("\n") == MARKER:
+                    domains.add(name)
+        except OSError:
+            continue
+    return domains
+
+
+def flush_dns():
+    subprocess.run(["/usr/bin/dscacheutil", "-flushcache"], check=False)
+    subprocess.run(["/usr/bin/killall", "-HUP", "mDNSResponder"], check=False)
+
+
+class Daemon:
+    def __init__(self, config_path, resolver_dir=RESOLVER_DIR):
+        self.config_path = config_path
+        self.resolver_dir = resolver_dir
+        self.last_error = None
+        self.warned = set()
+
+    def say(self, message):
+        print(time.strftime("%Y-%m-%d %H:%M:%S"), message, flush=True)
+
+    def sync(self, now=None):
+        """Make the blc-managed files in resolver_dir match what should be blocked now."""
+        try:
+            config = read_config(self.config_path)
+        except (ValueError, OSError) as e:
+            if str(e) != self.last_error:
+                self.say(f"can't read {self.config_path}, keeping current blocks: {e}")
+                self.last_error = str(e)
+            return
+        self.last_error = None
+        want = blocked_now(config, now)
+        have = managed_domains(self.resolver_dir)
+        changed = False
+        for domain in sorted(want - have):
+            path = os.path.join(self.resolver_dir, domain)
+            if os.path.lexists(path):
+                if domain not in self.warned:
+                    self.say(f"can't block {domain}: {path} exists and isn't managed by blc")
+                    self.warned.add(domain)
+                continue
+            os.makedirs(self.resolver_dir, exist_ok=True)
+            host, port = RESPONDER_ADDR
+            with open(path, "w") as f:
+                f.write(f"{MARKER}\nnameserver {host}\nport {port}\n")
+            self.say(f"blocked {domain}")
+            changed = True
+        for domain in sorted(have - want):
+            os.remove(os.path.join(self.resolver_dir, domain))
+            self.say(f"unblocked {domain}")
+            changed = True
+        if changed:
+            flush_dns()
+
+    def run(self):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind(RESPONDER_ADDR)
+        self.say(f"started, config {self.config_path}")
+        next_sync = 0.0
+        while True:
+            if time.monotonic() >= next_sync:
+                self.sync()
+                next_sync = time.monotonic() + POLL_SECONDS
+            ready, _, _ = select.select([sock], [], [], max(0.0, next_sync - time.monotonic()))
+            if not ready:
+                continue
+            try:
+                query, addr = sock.recvfrom(4096)
+                reply = nxdomain_reply(query)
+                if reply:
+                    sock.sendto(reply, addr)
+            except OSError:
+                continue
+
+
+# --- commands --------------------------------------------------------------
+
+
+def cmd_block(args):
+    domain = normalize_domain(args.domain)
+    if args.start is None:
+        start, end = ALL_DAY
+    elif args.end is None:
+        raise UserError("give both START and END, e.g. blc block youtube.com 00:00 19:00")
+    else:
+        start, end = parse_clock(args.start), parse_clock(args.end)
+        if start == end:
+            raise UserError("START and END are the same; leave both out to block all day")
+    rule = {"domain": domain, "start": format_clock(start), "end": format_clock(end)}
+    config = load_config()
+    if rule in config["rules"]:
+        print(f"{domain} is already blocked {describe(start, end)}.")
+        return
+    config["rules"].append(rule)
+    save_config(config)
+    log_event("block", domain, describe(start, end))
+    print(f"Blocking {domain} and its subdomains, {describe(start, end)}.")
+
+
+def cmd_pause(args):
+    domain = normalize_domain(args.domain)
+    seconds = parse_duration(args.duration)
+    comment = require_comment(args.comment)
+    config = load_config()
+    if domain not in {d for d, _, _ in valid_rules(config)}:
+        raise UserError(f"{domain} isn't blocked (see: blc status)")
+    until = int(time.time()) + seconds
+    config["pauses"] = [p for p in config["pauses"] if p.get("domain") != domain]
+    config["pauses"].append({"domain": domain, "until": until, "comment": comment})
+    save_config(config)
+    log_event("pause", domain, f"{args.duration} until {clock(until)}", comment)
+    print(f"{domain} is unblocked until {clock(until)}. Reload the page in a few seconds.")
+
+
+def cmd_resume(args):
+    domain = normalize_domain(args.domain)
+    config = load_config()
+    if domain not in active_pauses(config, time.time()):
+        raise UserError(f"{domain} isn't paused")
+    config["pauses"] = [p for p in config["pauses"] if p.get("domain") != domain]
+    save_config(config)
+    log_event("resume", domain)
+    print(f"{domain} follows its block schedule again.")
+
+
+def cmd_unblock(args):
+    domain = normalize_domain(args.domain)
+    comment = require_comment(args.comment)
+    config = load_config()
+    rules = [r for r in config["rules"] if r.get("domain") != domain]
+    if len(rules) == len(config["rules"]):
+        raise UserError(f"{domain} isn't blocked (see: blc status)")
+    config["rules"] = rules
+    config["pauses"] = [p for p in config["pauses"] if p.get("domain") != domain]
+    save_config(config)
+    log_event("unblock", domain, "", comment)
+    print(f"Removed all blocks for {domain}.")
+
+
+def cmd_status(args):
+    config = load_config()
+    rules = valid_rules(config)
+    if not rules:
+        print("Nothing is blocked. Try: blc block youtube.com 00:00 19:00")
+    now = time.time()
+    blocked = blocked_now(config, now)
+    pauses = active_pauses(config, now)
+    windows = {}
+    for domain, start, end in rules:
+        windows.setdefault(domain, []).append(describe(start, end))
+    width = max((len(d) for d in windows), default=0)
+    for domain, spans in windows.items():
+        if domain in blocked:
+            state = "BLOCKED"
+        elif domain in pauses:
+            state = f"paused until {clock(pauses[domain])}"
+        else:
+            state = "allowed"
+        print(f"{domain:<{width}}  {', '.join(spans):<13}  {state}")
+    if not daemon_running():
+        print("\nThe blc daemon isn't running, so nothing is enforced. Install it: sudo ./install.sh")
+    elif managed_domains(RESOLVER_DIR) != blocked:
+        print("\nApplying changes, this takes a couple of seconds.")
+
+
+def cmd_log(args):
+    try:
+        with open(LOG_PATH) as f:
+            lines = f.readlines()
+    except FileNotFoundError:
+        print("No history yet.")
+        return
+    for line in lines[-args.lines:]:
+        print(line.rstrip("\n").replace("\t", "  "))
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(prog="blc", description="Block websites on a schedule.")
+    commands = parser.add_subparsers(
+        dest="command", metavar="{block,pause,resume,unblock,status,log}"
+    )
+
+    p = commands.add_parser("block", help="block a domain and its subdomains, all day or START to END")
+    p.add_argument("domain")
+    p.add_argument("start", nargs="?", help="HH:MM, 24h")
+    p.add_argument("end", nargs="?", help="HH:MM, 24h; may be earlier than START to wrap past midnight")
+    p.set_defaults(func=cmd_block)
+
+    p = commands.add_parser("pause", help=f"unblock for a while (max {MAX_PAUSE // 3600}h), with a comment")
+    p.add_argument("domain")
+    p.add_argument("duration", help="e.g. 30min, 1h, 1h30m")
+    p.add_argument("comment", nargs="*", help=f"why, at least {MIN_COMMENT} characters")
+    p.set_defaults(func=cmd_pause)
+
+    p = commands.add_parser("resume", help="end a pause early")
+    p.add_argument("domain")
+    p.set_defaults(func=cmd_resume)
+
+    p = commands.add_parser("unblock", help="remove all blocks for a domain, with a comment")
+    p.add_argument("domain")
+    p.add_argument("comment", nargs="*", help=f"why, at least {MIN_COMMENT} characters")
+    p.set_defaults(func=cmd_unblock)
+
+    p = commands.add_parser("status", help="show rules and what is blocked now (default)")
+    p.set_defaults(func=cmd_status)
+
+    p = commands.add_parser("log", help="show recent blocks, pauses and unblocks")
+    p.add_argument("-n", "--lines", type=int, default=20)
+    p.set_defaults(func=cmd_log)
+
+    p = commands.add_parser("daemon")
+    p.add_argument("--config", required=True)
+
+    args = parser.parse_args(argv)
+    if args.command == "daemon":
+        Daemon(args.config).run()
+        return 0
+    if os.geteuid() == 0:
+        print("blc: run blc as yourself, without sudo", file=sys.stderr)
+        return 1
+    try:
+        getattr(args, "func", cmd_status)(args)
+    except UserError as e:
+        print(f"blc: {e}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
